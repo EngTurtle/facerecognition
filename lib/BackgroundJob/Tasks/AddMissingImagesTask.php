@@ -131,22 +131,42 @@ class AddMissingImagesTask extends FaceRecognitionBackgroundTask {
 	 * @return int Number of missing images found
 	 */
 	private function parseUserFolder(string $userId, int $model, Folder $folder): int {
-		$insertedImages = 0;
 		$nodes = $this->fileService->getPicturesFromFolder($folder);
-		foreach ($nodes as $file) {
-			$this->logDebug('Found ' . $file->getPath());
 
-			$image = new Image();
-			$image->setUser($userId);
-			$image->setFile($file->getId());
-			$image->setModel($model);
-			// todo: this check/insert logic for each image is so inefficient it hurts my mind
-			if ($this->imageMapper->imageExists($image) === null) {
-				// todo: can we have larger transaction with bulk insert?
-				$this->imageMapper->insert($image);
-				$insertedImages++;
+		if (count($nodes) === 0) {
+			return 0;
+		}
+
+		// Extract file IDs from all nodes
+		$fileIds = array_map(fn($file) => $file->getId(), $nodes);
+
+		// Bulk existence check - single query instead of N queries
+		$this->logDebug(sprintf('Checking %d files in bulk for user %s', count($fileIds), $userId));
+		$existingFileIds = $this->imageMapper->findExistingFileIds($userId, $model, $fileIds);
+		$existingSet = array_flip($existingFileIds);
+
+		// Build list of new images that don't exist yet
+		$newImages = [];
+		foreach ($nodes as $file) {
+			if (!isset($existingSet[$file->getId()])) {
+				$this->logDebug('Found ' . $file->getPath());
+
+				$image = new Image();
+				$image->setUser($userId);
+				$image->setFile($file->getId());
+				$image->setModel($model);
+				$newImages[] = $image;
 			}
 		}
+
+		if (empty($newImages)) {
+			$this->logDebug(sprintf('All %d files already exist in database, skipping insert', count($fileIds)));
+			return 0;
+		}
+
+		// Bulk insert - batched multi-value INSERT instead of individual inserts
+		$this->logDebug(sprintf('Bulk inserting %d new images for user %s', count($newImages), $userId));
+		$insertedImages = $this->imageMapper->insertBulk($newImages);
 
 		return $insertedImages;
 	}

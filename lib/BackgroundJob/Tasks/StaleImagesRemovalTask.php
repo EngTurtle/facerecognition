@@ -28,6 +28,7 @@ use OCP\IUser;
 use OCP\Files\File;
 use OCP\Files\Folder;
 use OCP\Files\Node;
+use OCP\Files\Cache\IFileAccess;
 
 use OCA\FaceRecognition\BackgroundJob\FaceRecognitionBackgroundTask;
 use OCA\FaceRecognition\BackgroundJob\FaceRecognitionContext;
@@ -61,6 +62,15 @@ class StaleImagesRemovalTask extends FaceRecognitionBackgroundTask {
 
 	/** @var SettingsService */
 	private $settingsService;
+
+	/** @var array Cache of validated parent paths to avoid repeated .nomedia checks */
+	private $validatedParentPaths = [];
+
+	/** @var int Counter for parent path cache hits (for logging) */
+	private $cacheHits = 0;
+
+	/** @var int Counter for parent path cache misses (for logging) */
+	private $cacheMisses = 0;
 
 	/**
 	 * @param ImageMapper $imageMapper Image mapper
@@ -136,62 +146,105 @@ class StaleImagesRemovalTask extends FaceRecognitionBackgroundTask {
 	 * which represent number of stale images removed
 	 */
 	private function staleImagesRemovalForUser(string $userId, int $model) {
-
 		$this->fileService->setupFS($userId);
 
-		$this->logDebug(sprintf('Getting all images for user %s', $userId));
-		$allImages = $this->imageMapper->findImages($userId, $model);
-		$this->logDebug(sprintf('Found %d images for user %s', count($allImages), $userId));
-		yield;
-
-		// Find if we stopped somewhere abruptly before. If we are, we need to start from that point.
-		// If there is value, we start from beggining. Important is that:
-		// * There needs to be some (any!) ordering here, we used "id" for ordering key
-		// * New images will be processed, or some might be checked more than once, and that is OK
-		//   Important part is that we make continuous progess.
+		// Get IFileAccess for bulk cache lookups
+		$fileAccess = \OCP\Server::get(IFileAccess::class);
+		$userFolder = $this->fileService->getUserFolder($userId);
+		$storageId = $userFolder->getStorage()->getCache()->getNumericStorageId();
 
 		$lastChecked = $this->settingsService->getLastStaleImageChecked($userId);
-		$this->logDebug(sprintf('Last checked image id for user %s is %d', $userId, $lastChecked));
-		yield;
-
-		// Now filter by those above last checked and sort remaining images
-		$allImages = array_filter($allImages, function ($i) use($lastChecked) {
-			return $i->id > $lastChecked;
-		});
-		usort($allImages, function ($i1, $i2) {
-			return $i1->id <=> $i2->id;
-		});
-		$this->logDebug(sprintf(
-			'After filtering and sorting, there is %d remaining stale images to check for user %s',
-			count($allImages), $userId));
-		yield;
-
-		// Now iterate and check remaining images
-		$processed = 0;
+		$batchSize = 1000;
 		$imagesRemoved = 0;
-		foreach ($allImages as $image) {
-			$file = $this->fileService->getFileById($image->getFile(), $userId);
+		$processed = 0;
 
-			// Delete image doesn't exist anymore in filesystem or it is under .nomedia
-			if (($file === null) || (!$this->fileService->isAllowedNode($file)) ||
-			    ($this->fileService->isUnderNoDetection($file))) {
-				$this->deleteImage($image, $userId);
-				$imagesRemoved++;
+		// Reset parent path cache and stats for each user
+		$this->validatedParentPaths = [];
+		$this->cacheHits = 0;
+		$this->cacheMisses = 0;
+
+		$this->logDebug(sprintf('Starting stale image removal for user %s from image ID %d', $userId, $lastChecked));
+		yield;
+
+		while (true) {
+			// Fetch next batch from database (SQL-level filtering!)
+			$batch = $this->imageMapper->findImagesAfter($userId, $model, $lastChecked, $batchSize);
+
+			if (empty($batch)) {
+				break; // No more images to process
 			}
 
-			// Remember last processed image
-			$this->settingsService->setLastStaleImageChecked($image->id, $userId);
+			$this->logDebug(sprintf('Processing batch of %d images for user %s', count($batch), $userId));
 
-			// Yield from time to time
-			$processed++;
-			if ($processed % 10 === 0) {
-				$this->logDebug(sprintf('Processed %d/%d stale images for user %s', $processed, count($allImages), $userId));
-				yield;
+			// Extract file IDs for bulk lookup
+			$fileIds = array_map(fn($img) => $img->getFile(), $batch);
+
+			// PHASE 1: Bulk cache lookup - single query for up to 1000 files
+			$cacheEntries = $fileAccess->getByFileIdsInStorage($fileIds, $storageId);
+			$this->logDebug(sprintf('Bulk cache lookup: %d entries found from %d file IDs', count($cacheEntries), count($fileIds)));
+
+			// PHASE 2: Process each image in the batch
+			foreach ($batch as $image) {
+				$fileId = $image->getFile();
+
+				// Quick check: file missing from cache = definitely stale
+				if (!isset($cacheEntries[$fileId])) {
+					$this->deleteImage($image, $userId);
+					$imagesRemoved++;
+					$lastChecked = $image->id;
+					continue;
+				}
+
+				// File exists in cache - get Node for mount/nomedia checks
+				$nodes = $userFolder->getById($fileId);
+				$node = count($nodes) > 0 ? $nodes[0] : null;
+
+				$shouldDelete = false;
+
+				if ($node === null) {
+					// Shouldn't happen but defensive check
+					$shouldDelete = true;
+				} else if (!$this->fileService->isAllowedNode($node)) {
+					// Mount type not allowed (shared/external/group)
+					$shouldDelete = true;
+				} else if ($this->isUnderNoDetectionCached($node)) {
+					// Under .nomedia directory (with caching!)
+					$shouldDelete = true;
+				}
+
+				if ($shouldDelete) {
+					$this->deleteImage($image, $userId);
+					$imagesRemoved++;
+				}
+
+				$lastChecked = $image->id;
+				$processed++;
+
+				// Yield every 10 images to allow other background tasks
+				if ($processed % 10 === 0) {
+					$this->logDebug(sprintf('Processed %d images for user %s (%d removed)', $processed, $userId, $imagesRemoved));
+					yield;
+				}
 			}
+
+			// Save progress after each batch
+			$this->settingsService->setLastStaleImageChecked($lastChecked, $userId);
+			yield;
 		}
 
-		// Remove this value when we are done, so next cleanup can start from 0
+		// Reset checkpoint when complete
 		$this->settingsService->setLastStaleImageChecked(0, $userId);
+
+		$this->logInfo(sprintf('Completed stale image removal for user %s: processed %d images, removed %d stale images',
+			$userId, $processed, $imagesRemoved));
+
+		// Log cache efficiency stats
+		$totalCacheChecks = $this->cacheHits + $this->cacheMisses;
+		if ($totalCacheChecks > 0) {
+			$cacheHitRate = ($this->cacheHits / $totalCacheChecks) * 100;
+			$this->logDebug(sprintf('Parent path cache stats: %d hits, %d misses (%.1f%% hit rate)',
+				$this->cacheHits, $this->cacheMisses, $cacheHitRate));
+		}
 
 		return $imagesRemoved;
 	}
@@ -204,5 +257,33 @@ class StaleImagesRemovalTask extends FaceRecognitionBackgroundTask {
 		$this->personMapper->invalidatePersons($image->id);
 		$this->faceMapper->removeFromImage($image->id);
 		$this->imageMapper->delete($image);
+	}
+
+	/**
+	 * Check if node is under .nomedia directory with parent path caching
+	 * Caches validated parent paths to avoid repeated tree walks
+	 *
+	 * @param Node $node The node to check
+	 * @return bool True if under .nomedia directory
+	 */
+	private function isUnderNoDetectionCached(Node $node): bool {
+		$parentPath = dirname($node->getPath());
+
+		// Check if we've already validated this parent folder
+		if (isset($this->validatedParentPaths[$parentPath])) {
+			$this->cacheHits++;
+			return false; // Parent was validated as NOT under .nomedia
+		}
+
+		// Perform the expensive tree walk check
+		$this->cacheMisses++;
+		$isUnderNoDetection = $this->fileService->isUnderNoDetection($node);
+
+		if (!$isUnderNoDetection) {
+			// Cache this parent as validated (not under .nomedia)
+			$this->validatedParentPaths[$parentPath] = true;
+		}
+
+		return $isUnderNoDetection;
 	}
 }

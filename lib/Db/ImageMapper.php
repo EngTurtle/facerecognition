@@ -379,4 +379,95 @@ class ImageMapper extends QBMapper {
 			->execute();
 	}
 
+	/**
+	 * Find which file IDs already exist as images for a user/model
+	 * Performs a single bulk query instead of checking existence one-by-one
+	 *
+	 * @param string $userId User ID
+	 * @param int $model Model ID
+	 * @param int[] $fileIds Array of file IDs to check
+	 * @return int[] Array of file IDs that already exist
+	 */
+	public function findExistingFileIds(string $userId, int $model, array $fileIds): array {
+		if (empty($fileIds)) {
+			return [];
+		}
+
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('file')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('user', $qb->createNamedParameter($userId)))
+			->andWhere($qb->expr()->eq('model', $qb->createNamedParameter($model)))
+			->andWhere($qb->expr()->in('file', $qb->createNamedParameter($fileIds, IQueryBuilder::PARAM_INT_ARRAY)));
+
+		$result = $qb->executeQuery();
+		$existingFileIds = $result->fetchAll(\PDO::FETCH_COLUMN);
+		$result->closeCursor();
+
+		return $existingFileIds;
+	}
+
+	/**
+	 * Bulk insert images within transactions
+	 * Processes in batches of 500 within transactions for better performance
+	 *
+	 * @param Image[] $images Array of Image entities to insert
+	 * @return int Number of images inserted
+	 */
+	public function insertBulk(array $images): int {
+		if (empty($images)) {
+			return 0;
+		}
+
+		$inserted = 0;
+
+		// Process in batches of 500 within transactions
+		foreach (array_chunk($images, 500) as $batch) {
+			$this->db->beginTransaction();
+			try {
+				foreach ($batch as $image) {
+					$qb = $this->db->getQueryBuilder();
+					$qb->insert($this->getTableName())
+						->values([
+							'user' => $qb->createNamedParameter($image->getUser(), IQueryBuilder::PARAM_STR),
+							'file' => $qb->createNamedParameter($image->getFile(), IQueryBuilder::PARAM_INT),
+							'model' => $qb->createNamedParameter($image->getModel(), IQueryBuilder::PARAM_INT),
+							'is_processed' => $qb->createNamedParameter(false, IQueryBuilder::PARAM_BOOL),
+						]);
+					$qb->executeStatement();
+					$inserted++;
+				}
+				$this->db->commit();
+			} catch (\Exception $e) {
+				$this->db->rollBack();
+				throw $e;
+			}
+		}
+
+		return $inserted;
+	}
+
+	/**
+	 * Find images after a given ID for progressive processing
+	 * Used by background tasks to process large datasets in batches
+	 *
+	 * @param string $userId User ID
+	 * @param int $model Model ID
+	 * @param int $afterId Start after this image ID (0 to start from beginning)
+	 * @param int $limit Maximum number of results
+	 * @return Image[] Array of Image entities
+	 */
+	public function findImagesAfter(string $userId, int $model, int $afterId, int $limit): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('id', 'file')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('user', $qb->createNamedParameter($userId)))
+			->andWhere($qb->expr()->eq('model', $qb->createNamedParameter($model)))
+			->andWhere($qb->expr()->gt('id', $qb->createNamedParameter($afterId, IQueryBuilder::PARAM_INT)))
+			->orderBy('id', 'ASC')
+			->setMaxResults($limit);
+
+		return $this->findEntities($qb);
+	}
+
 }
