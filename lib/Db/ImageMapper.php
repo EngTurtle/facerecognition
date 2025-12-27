@@ -381,7 +381,7 @@ class ImageMapper extends QBMapper {
 
 	/**
 	 * Find which file IDs already exist as images for a user/model
-	 * Performs a single bulk query instead of checking existence one-by-one
+	 * Performs bulk queries in chunks of 1000
 	 *
 	 * @param string $userId User ID
 	 * @param int $model Model ID
@@ -393,16 +393,21 @@ class ImageMapper extends QBMapper {
 			return [];
 		}
 
-		$qb = $this->db->getQueryBuilder();
-		$qb->select('file')
-			->from($this->getTableName())
-			->where($qb->expr()->eq('user', $qb->createNamedParameter($userId)))
-			->andWhere($qb->expr()->eq('model', $qb->createNamedParameter($model)))
-			->andWhere($qb->expr()->in('file', $qb->createNamedParameter($fileIds, IQueryBuilder::PARAM_INT_ARRAY)));
+		$existingFileIds = [];
 
-		$result = $qb->executeQuery();
-		$existingFileIds = $result->fetchAll(\PDO::FETCH_COLUMN);
-		$result->closeCursor();
+		// Process in chunks of 1000 to avoid Oracle's expression limit
+		foreach (array_chunk($fileIds, 1000) as $chunk) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->select('file')
+				->from($this->getTableName())
+				->where($qb->expr()->eq('user', $qb->createNamedParameter($userId)))
+				->andWhere($qb->expr()->eq('model', $qb->createNamedParameter($model)))
+				->andWhere($qb->expr()->in('file', $qb->createNamedParameter($chunk, IQueryBuilder::PARAM_INT_ARRAY)));
+
+			$result = $qb->executeQuery();
+			$existingFileIds = array_merge($existingFileIds, $result->fetchAll(\PDO::FETCH_COLUMN));
+			$result->closeCursor();
+		}
 
 		return $existingFileIds;
 	}
