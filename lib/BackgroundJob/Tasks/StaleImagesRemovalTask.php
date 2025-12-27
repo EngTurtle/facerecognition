@@ -220,8 +220,8 @@ class StaleImagesRemovalTask extends FaceRecognitionBackgroundTask {
 				$lastChecked = $image->id;
 				$processed++;
 
-				// Yield every 10 images to allow other background tasks
-				if ($processed % 10 === 0) {
+				// Yield every 200 images to allow other background tasks
+				if ($processed % 200 === 0) {
 					$this->logDebug(sprintf('Processed %d images for user %s (%d removed)', $processed, $userId, $imagesRemoved));
 					yield;
 				}
