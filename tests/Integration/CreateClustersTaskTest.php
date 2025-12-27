@@ -38,6 +38,9 @@ use OCA\FaceRecognition\Model\ModelManager;
 
 use Test\TestCase;
 
+/**
+ * @group DB
+ */
 class CreateClustersTaskTest extends IntegrationTestCase {
 
 	/**

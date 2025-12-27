@@ -40,6 +40,9 @@ use OCA\FaceRecognition\Model\ModelManager;
 
 use Test\TestCase;
 
+/**
+ * @group DB
+ */
 class MergeClusterToDatabaseTest extends IntegrationTestCase {
 
 	public function testMergeEmptyClusterToDatabase() {

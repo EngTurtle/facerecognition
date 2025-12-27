@@ -39,6 +39,7 @@ use Test\TestCase;
 
 /**
  * Main class that all integration tests should inherit from.
+ * @group DB
  */
 abstract class IntegrationTestCase extends TestCase {
 	/** @var IAppContainer */

@@ -42,6 +42,9 @@ use OCA\FaceRecognition\Model\ModelManager;
 
 use Test\TestCase;
 
+/**
+ * @group DB
+ */
 class ResetAllTest extends IntegrationTestCase {
 
 	/**

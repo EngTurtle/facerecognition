@@ -41,6 +41,9 @@ use OCA\FaceRecognition\Service\SettingsService;
 
 use Test\TestCase;
 
+/**
+ * @group DB
+ */
 class StaleImagesRemovalTaskTest extends IntegrationTestCase {
 
 	/**
